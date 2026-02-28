@@ -358,10 +358,38 @@ accounts 테이블
 ## 5. 핵심 기능
 
 ### 5.1 기프티 발행
-- 관리자가 기프티 종류(금액권, 할인권 등) 생성
-- 각 기프티에 고유 ID 및 QR코드 부여
-- 유효기간 설정
-- 사용 가능 가맹점 지정 (전체 / 특정 가맹점)
+
+#### 5.1.1 발행 흐름 개요
+
+```
+[재고 상품 등록]  →  [개별 재고 입고 (고유상품번호 단위)]
+       ↓
+[사용자 구매 결제] OR [관리자 직접 발행]
+       ↓
+[voucher 생성 — 사용자 소유 기프티]
+       ↓
+[바코드 제시 → 가맹점 스캔 → 사용 처리]
+```
+
+#### 5.1.2 재고 관리 (`gifticon_storage` / `storage_items`)
+
+| 개념 | 설명 |
+|------|------|
+| **gifticon_storage** | 상품 카탈로그 (SKU 단위): 브랜드, 상품명, 권면금액, 판매가, 재고수, 발행수 |
+| **storage_items** | 개별 실물 아이템 1개 = 1행, 고유상품번호(`product_code`) 보유 |
+| 입고 방식 | 관리자가 고유상품번호를 한 줄에 1개씩 입력 (최대 500개/회) |
+| FIFO 발행 | 발행 시 입고일 기준 가장 오래된 아이템부터 자동 선택 |
+| 재고 동기 | `storage_items` 상태 변경 시 `gifticon_storage.stock_count` 자동 갱신 |
+
+#### 5.1.3 발행 경로
+
+| 경로 | 주체 | 설명 |
+|------|------|------|
+| 사용자 구매 | 사용자 | 스토어에서 결제 → storage_item 자동 선택 → voucher 발행 |
+| 관리자 발행 | 관리자 | `/page/manager` 발행 탭 → 사용자 검색 → 상품 선택 → 즉시 발행 |
+| 직접 등록 | 관리자 | 재고 미연결 voucher 수동 생성 (테스트/특수케이스) |
+
+모든 발행 경로는 `activity_logs`에 전체 스냅샷과 함께 기록된다.
 
 ### 5.2 기프티 구매
 - PayPal/SmileyPay 기본 결제, USDT 보조 결제
@@ -373,12 +401,13 @@ accounts 테이블
 - **장바구니**: 여러 상품을 담아 한번에 구매 가능
 
 #### 5.2.1 스토어 상품 구조
-스토어는 브랜드별 기프티콘 단위로 구성된다. 관리자가 상품을 등록·관리하며, 사용자는 할인가로 구매한다.
+스토어는 `gifticon_storage` 기반의 상품 카탈로그로 구성된다. 관리자가 상품을 등록·재고를 입고하며, 사용자는 할인가로 구매한다.
 
 | 항목 | 설명 |
 |------|------|
-| 상품 단위 | 브랜드별 기프티콘 (예: 스타벅스 아메리카노, 신세계 상품권 등) |
-| 가격 표기 | KRW (원화), 원가 + 할인율 + 판매가 |
+| 상품 단위 | `gifticon_storage` 1행 = 1 SKU (예: 스타벅스 아메리카노 Tall) |
+| 가격 표기 | KRW (원화), 권면금액 + 판매가(할인율 자동 계산) |
+| 재고 표시 | `stock_count > 0`인 상품만 구매 가능 노출 |
 | 유효기간 배지 | 상품 이미지에 만료까지 남은 일수 표시 |
 | 정렬 | 최신순 / 인기순 / 낮은 가격순 / 높은 가격순 |
 
@@ -1330,6 +1359,38 @@ Cron Trigger (1일 2회: 00:00, 12:00 UTC)
 - **앱 표시 시**: 사용자 언어/로케일 기반 현지 통화 참고 표시 (USD→KRW, USD→MYR 등)
 - **수동 정산 시**: 가맹점이 직접 금액 입력 (내부 환율 참고값 제공)
 
+### 8.4 기프티 금액 잠금 및 사용자 표시 (미구현 — 추후 적용)
+
+**설계 원칙**: 기프티(voucher)는 **발행 시점의 금액을 고정**하여 이후 환율 변동과 무관하게 동일한 가치를 보장한다.
+
+#### 발행 시 저장 (구현 완료 — migration 0008)
+
+| 컬럼 | 설명 |
+|------|------|
+| `face_value_base` | 기준 통화로 표시한 액면가 (REAL) |
+| `base_currency`   | 기준 통화 코드 (`KRW` / `USD` / `IDR`) |
+
+- `base_currency` = 재고 상품의 `display_currency`
+- `face_value_base` 계산 규칙:
+  - `display_currency = 'KRW'` → `face_value` (정수 KRW)
+  - `display_currency = 'USD'` → `face_value_usd`
+  - `display_currency = 'IDR'` → `ROUND(face_value_usd × IDR_rate)` (발행 시점 환율)
+
+#### 사용자 API 표시 (미구현 — 추후 적용)
+
+사용자에게 기프티 금액을 보여줄 때:
+1. `base_currency`가 사용자 표시 통화와 같으면 → `face_value_base` 그대로 표시
+2. 다르면 → `face_value_base` ÷ (base_currency→USD rate) × (표시통화→USD rate) 로 환산
+3. 소수점 처리: KRW/IDR → 정수, USD → 소수 2자리
+
+```
+표시 금액 = face_value_base
+            × (exchange_rates[display_currency] / exchange_rates[base_currency])
+```
+
+> **구현 위치**: 사용자 기프티 조회 API (`GET /api/vouchers`, `GET /api/vouchers/:id`)
+> 현재(2026-03-01)는 face_value(KRW 정수)를 그대로 반환하고 있으며, 추후 위 로직으로 교체 예정.
+
 ## 9. 데이터 모델 (D1 / SQLite)
 
 > **ID 컬럼 규칙**: INTEGER PRIMARY KEY AUTOINCREMENT, 컬럼명은 테이블명의 단수형
@@ -1591,6 +1652,67 @@ Cron Trigger (1일 2회: 00:00, 12:00 UTC)
 > - 판매 취소 시: status → cancelled, 연결 기프티 status → active 복원
 > - 기프티 만료 시: status → expired 자동 전환
 
+### 9.14 재고 상품 (gifticon_storage)
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| id | TEXT (UUID) | PK |
+| brand_slug | TEXT | FK → brands(slug) |
+| name | TEXT | 상품명 |
+| face_value | INTEGER | 권면금액 (KRW) |
+| price | INTEGER | 판매가 (KRW, 할인가 가능) |
+| image_url | TEXT | 상품 이미지 (/api/images/storage/{id}/...) |
+| thumb_url | TEXT | 썸네일 (200×200 JPEG) |
+| stock_count | INTEGER | 현재 재고 수 (`in_stock` 상태 아이템 수) |
+| total_issued | INTEGER | 누적 발행 수 |
+| status | TEXT | active / inactive / discontinued |
+| created_at | INTEGER | Unix timestamp |
+| updated_at | INTEGER | Unix timestamp |
+
+### 9.15 개별 재고 아이템 (storage_items)
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| id | TEXT (UUID) | PK |
+| storage_id | TEXT | FK → gifticon_storage(id) |
+| **product_code** | TEXT UNIQUE | **고유상품번호** (바코드, 시리얼 등 — 브랜드 발행 원본 코드) |
+| status | TEXT | in_stock / issued / voided |
+| issued_voucher_id | TEXT | FK → vouchers(id), 발행 시 연결 |
+| received_at | INTEGER | 입고 일시 |
+| issued_at | INTEGER | 발행 일시 |
+| received_by | TEXT | FK → users(id), 입고 처리 관리자 |
+| issued_by | TEXT | FK → users(id), 발행 관리자 (NULL = 사용자 직접 구매) |
+| created_at | INTEGER | Unix timestamp |
+
+> - FIFO 발행: `received_at ASC ORDER LIMIT 1`로 가장 오래된 아이템 선택
+> - 재고 연결 voucher: `vouchers.storage_id`, `vouchers.storage_item_id` FK 보유
+
+### 9.16 활동 로그 (activity_logs)
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| id | TEXT (UUID) | PK |
+| action | TEXT | 액션 코드 (아래 표 참조) |
+| actor_id | TEXT | FK → users(id), 행위자 |
+| actor_role | TEXT | admin / user / merchant / system |
+| target_type | TEXT | user / storage / storage_item / voucher / transaction |
+| target_id | TEXT | 대상 레코드 id |
+| snapshot | TEXT (JSON) | 행위 시점 대상 데이터 전체 스냅샷 |
+| meta | TEXT (JSON) | 추가 컨텍스트 (변경 전값, 수량, 금액, 메모 등) |
+| created_at | INTEGER | Unix timestamp |
+
+**action 코드 목록**
+
+| action | 발생 시점 |
+|--------|----------|
+| `user_register` | 신규 Telegram 로그인 |
+| `user_update` | 프로필 수정 |
+| `storage_create` | 재고 상품 등록 |
+| `storage_update` | 재고 상품 수정 |
+| `stock_receive` | 재고 입고 (상품코드 배열 + 수량 포함) |
+| `voucher_issue` | 관리자 기프티 발행 (storage_item 연결) |
+| `voucher_direct_create` | 관리자 직접 기프티 등록 (재고 미연결) |
+| `voucher_use` | 가맹점 바코드 스캔 사용 처리 |
+| `voucher_transfer` | 기프티 양도 |
+| `voucher_gift` | 기프티 선물 |
+
 ## 10. API 엔드포인트 (Hono)
 
 ### 10.1 인증
@@ -1730,25 +1852,21 @@ Cron Trigger (1일 2회: 00:00, 12:00 UTC)
 | 정산 | 정산 현황, 실결제 내역 목록, 수동 입력 |
 | 가맹점 설정 | 가맹점 프로필, 정산 지갑 관리 |
 
-### 11.4 관리자 웹 (Pages 서빙)
-| 화면 | 설명 |
-|------|------|
-| 로그인 | 관리자 전용 로그인 |
-| 대시보드 | 통계, 차트, 주요 지표, 현재 환율 |
-| 기프티 관리 | 템플릿 CRUD, 발행 현황 |
-| 가맹점 관리 | 가맹점 CRUD, 승인/거절, 상태 관리 |
-| 계정 관리 | 계정 목록, 상세, 타입별 필터, 한도 설정, 제한/정지/해제 |
-| 제한 사용자 | 현재 restricted/suspended 사용자 목록, 사유, 즉시 조치 |
-| 거래 내역 | 전체 자동 거래 조회, 필터 |
-| 실결제 내역 | 가맹점 수동 입력 내역 조회, 자동 로그 대조 |
-| 환불 관리 | 환불 요청 목록, 승인/거절 |
-| 정산 관리 | 월별 정산 목록, 정산 생성/실행/소멸, 상세 거래 조회 |
-| 낙전 관리 | 만료 기프티 낙전 수익 집계, 기간별 조회 |
-| 사전 매입 관리 | 매입 계약 CRUD, 잔액 현황, 발행 이력 |
-| 환율 관리 | 현재 캐시 환율, 수동 갱신, 이력 조회 |
-| 중고거래 관리 | 전체 중고거래 목록, 거래 상태, 수수료 수익 집계 |
-| OTA 관리 | 앱 번들 업로드, 버전 관리 |
-| API 테스트 | API 엔드포인트 테스트 페이지 |
+### 11.4 관리자 웹 (`/page/manager` — Cloudflare Pages 서빙)
+
+> Telegram 로그인 후 admins 테이블에 등록된 사용자만 접근 가능
+
+| 탭 | URL 경로 | 설명 |
+|----|----------|------|
+| 📊 대시보드 | `/page/manager` | 사용자/기프티/거래/관리자 집계, 최근 가입자 |
+| 👥 사용자 | | 사용자 목록·검색, 이름/이메일/역할 수정 |
+| 🏷️ 브랜드 | | 브랜드 CRUD, 로고·썸네일 이미지 업로드 |
+| 📦 재고 | | `gifticon_storage` 목록, 상품 등록/수정, **재고 입고 (고유상품번호 배치 입력)** |
+| 🎟️ 발행 | | 사용자 검색 → 재고 상품 선택 → 관리자 직접 기프티 발행 |
+| 🎁 기프티 | | 발행된 voucher 목록, 상태 변경, 직접 등록 |
+| 💳 거래내역 | | transactions 전체 조회 |
+| 🔑 관리자 관리 | | admins CRUD (Telegram ID로 등록) |
+| 📋 로그 | | `activity_logs` 조회 (action/날짜 필터, 스냅샷·메타 상세 보기) |
 
 ## 12. 보안 요구사항
 
